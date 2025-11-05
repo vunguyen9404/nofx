@@ -36,7 +36,7 @@ func New() *Client {
 		Provider: ProviderDeepSeek,
 		BaseURL:  "https://api.deepseek.com/v1",
 		Model:    "deepseek-chat",
-		Timeout:  120 * time.Second, // 增加到120秒，因为AI需要分析大量数据
+		Timeout:  180 * time.Second, // 增加到180秒以支持长prompt (如adaptive 549行)
 	}
 }
 
@@ -167,6 +167,18 @@ func (client *Client) callOnce(systemPrompt, userPrompt string) (string, error) 
 	if len(client.APIKey) > 8 {
 		log.Printf("   API Key: %s...%s", client.APIKey[:4], client.APIKey[len(client.APIKey)-4:])
 	}
+	
+	// 打印 prompt 长度信息（用于 debug token limit 问题）
+	systemPromptLen := len(systemPrompt)
+	userPromptLen := len(userPrompt)
+	estimatedTokens := (systemPromptLen + userPromptLen) / 3 // 粗略估算: 3 chars ≈ 1 token
+	log.Printf("   System Prompt: %d chars (~%d tokens)", systemPromptLen, systemPromptLen/3)
+	log.Printf("   User Prompt: %d chars (~%d tokens)", userPromptLen, userPromptLen/3)
+	log.Printf("   Total Input: ~%d tokens (max_tokens=4000)", estimatedTokens)
+	
+	if estimatedTokens > 3000 {
+		log.Printf("⚠️  [MCP] 输入 token 较多，可能影响响应速度或导致超时")
+	}
 
 	// 构建 messages 数组
 	messages := []map[string]string{}
@@ -190,7 +202,7 @@ func (client *Client) callOnce(systemPrompt, userPrompt string) (string, error) 
 		"model":       client.Model,
 		"messages":    messages,
 		"temperature": 0.5, // 降低temperature以提高JSON格式稳定性
-		"max_tokens":  2000,
+		"max_tokens":  4000, // 增加到4000以支持长prompt (如adaptive)和详细分析
 	}
 
 	// 注意：response_format 参数仅 OpenAI 支持，DeepSeek/Qwen 不支持
@@ -246,7 +258,18 @@ func (client *Client) callOnce(systemPrompt, userPrompt string) (string, error) 
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("API返回错误 (status %d): %s", resp.StatusCode, string(body))
+		// 详细记录错误信息，帮助 debug
+		log.Printf("❌ [MCP] API 返回错误:")
+		log.Printf("   Status Code: %d", resp.StatusCode)
+		log.Printf("   Response Body: %s", string(body))
+		
+		// 检查是否是 token limit 错误
+		bodyStr := string(body)
+		if strings.Contains(bodyStr, "token") || strings.Contains(bodyStr, "length") || strings.Contains(bodyStr, "max") {
+			return "", fmt.Errorf("可能是 token limit 超限 (status %d): %s", resp.StatusCode, bodyStr)
+		}
+		
+		return "", fmt.Errorf("API返回错误 (status %d): %s", resp.StatusCode, bodyStr)
 	}
 
 	// 解析响应

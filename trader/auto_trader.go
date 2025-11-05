@@ -197,6 +197,7 @@ func NewAutoTrader(config AutoTraderConfig) (*AutoTrader, error) {
 	if systemPromptTemplate == "" {
 		systemPromptTemplate = "default" // 默认使用 default 模板
 	}
+	log.Printf("📋 [%s] System Prompt: %s", config.Name, systemPromptTemplate)
 
 	return &AutoTrader{
 		id:                    config.ID,
