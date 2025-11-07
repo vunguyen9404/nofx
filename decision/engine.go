@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"nofx/logger"
 	"nofx/market"
 	"nofx/mcp"
 	"nofx/pool"
@@ -271,7 +272,9 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	// 3. 输出格式 - 动态生成
 	sb.WriteString("#输出格式\n\n")
 	sb.WriteString("第一步: 思维链（纯文本）\n")
-	sb.WriteString("简洁分析你的思考过程\n\n")
+	sb.WriteString("简洁分析你的思考过程\n")
+	sb.WriteString("❌ 禁止使用 [标题] 格式（会导致解析错误）\n")
+	sb.WriteString("✅ 使用 \"标题:\" 或 \"**标题:**\" 格式\n\n")
 	sb.WriteString("第二步: JSON决策数组\n\n")
 	sb.WriteString("```json\n[\n")
 	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300, \"reasoning\": \"下跌趋势+MACD死叉\"},\n", btcEthLeverage, accountEquity*5))
@@ -366,16 +369,88 @@ func buildUserPrompt(ctx *Context) string {
 	}
 	sb.WriteString("\n")
 
-	// 夏普比率（直接传值，不要复杂格式化）
+	// 性能分析（完整数据）
 	if ctx.Performance != nil {
-		// 直接从interface{}中提取SharpeRatio
-		type PerformanceData struct {
-			SharpeRatio float64 `json:"sharpe_ratio"`
-		}
-		var perfData PerformanceData
-		if jsonData, err := json.Marshal(ctx.Performance); err == nil {
-			if err := json.Unmarshal(jsonData, &perfData); err == nil {
-				sb.WriteString(fmt.Sprintf("## 📊 夏普比率: %.2f\n\n", perfData.SharpeRatio))
+		if perfAnalysis, ok := ctx.Performance.(*logger.PerformanceAnalysis); ok && perfAnalysis.TotalTrades > 0 {
+			sb.WriteString("## 📊 Performance Analysis (Last 100 Cycles)\n\n")
+			
+			// Overall metrics
+			sb.WriteString(fmt.Sprintf("**Overall:** Sharpe %.2f | Win Rate %.1f%% (%dW-%dL) | Profit Factor %.2f | Total Trades: %d\n\n",
+				perfAnalysis.SharpeRatio,
+				perfAnalysis.WinRate,
+				perfAnalysis.WinningTrades,
+				perfAnalysis.LosingTrades,
+				perfAnalysis.ProfitFactor,
+				perfAnalysis.TotalTrades))
+			
+			// Top performers
+			if len(perfAnalysis.SymbolStats) > 0 {
+				topSymbols := getTopSymbols(perfAnalysis.SymbolStats, 3)
+				if len(topSymbols) > 0 {
+					sb.WriteString("**🏆 Top Performers (FAVOR):**\n")
+					for i, symbol := range topSymbols {
+						stats := perfAnalysis.SymbolStats[symbol]
+						sb.WriteString(fmt.Sprintf("%d. %s: %.0f%% win rate (%dW-%dL), avg %+.1f USDT\n",
+							i+1, symbol, stats.WinRate, stats.WinningTrades, stats.LosingTrades, stats.AvgPnL))
+					}
+					sb.WriteString("\n")
+				}
+				
+				// Worst performers
+				worstSymbols := getWorstSymbols(perfAnalysis.SymbolStats, 3)
+				if len(worstSymbols) > 0 {
+					sb.WriteString("**⚠️ Poor Performers (AVOID or REDUCE SIZE):**\n")
+					for i, symbol := range worstSymbols {
+						stats := perfAnalysis.SymbolStats[symbol]
+						sb.WriteString(fmt.Sprintf("%d. %s: %.0f%% win rate (%dW-%dL), avg %+.1f USDT\n",
+							i+1, symbol, stats.WinRate, stats.WinningTrades, stats.LosingTrades, stats.AvgPnL))
+					}
+					sb.WriteString("\n")
+				}
+			}
+			
+			// Recent trades (last 5)
+			if len(perfAnalysis.RecentTrades) > 0 {
+				sb.WriteString("**📝 Recent Trades:**\n")
+				count := 5
+				if len(perfAnalysis.RecentTrades) < count {
+					count = len(perfAnalysis.RecentTrades)
+				}
+				now := time.Now()
+				for i := 0; i < count; i++ {
+					trade := perfAnalysis.RecentTrades[i]
+					result := "❌"
+					if trade.PnL > 0 {
+						result = "✅"
+					}
+					
+					// Calculate "closed ago" time
+					closedAgo := now.Sub(trade.CloseTime)
+					closedAgoStr := ""
+					if closedAgo < time.Hour {
+						mins := int(closedAgo.Minutes())
+						closedAgoStr = fmt.Sprintf("%dm ago", mins)
+					} else {
+						hours := int(closedAgo.Hours())
+						mins := int(closedAgo.Minutes()) % 60
+						if mins > 0 {
+							closedAgoStr = fmt.Sprintf("%dh%dm ago", hours, mins)
+						} else {
+							closedAgoStr = fmt.Sprintf("%dh ago", hours)
+						}
+					}
+					
+					// Add SL marker if stop loss
+					slMarker := ""
+					if trade.WasStopLoss {
+						slMarker = " | SL"
+					}
+					
+					sb.WriteString(fmt.Sprintf("- %s %s %s: %+.1f USDT (%+.1f%%) [%s | closed %s%s]\n",
+						result, trade.Symbol, strings.ToUpper(trade.Side), trade.PnL, trade.PnLPct, 
+						trade.Duration, closedAgoStr, slMarker))
+				}
+				sb.WriteString("\n")
 			}
 		}
 	}
@@ -590,4 +665,68 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 	}
 
 	return nil
+}
+
+// getTopSymbols 获取表现最好的N个币种（按总盈亏排序）
+func getTopSymbols(symbolStats map[string]*logger.SymbolPerformance, n int) []string {
+	type symbolScore struct {
+		symbol string
+		pnl    float64
+	}
+	
+	var scores []symbolScore
+	for symbol, stats := range symbolStats {
+		// 需要至少2次交易才有统计意义
+		if stats.TotalTrades >= 2 {
+			scores = append(scores, symbolScore{symbol: symbol, pnl: stats.TotalPnL})
+		}
+	}
+	
+	// 按盈亏降序排序
+	for i := 0; i < len(scores); i++ {
+		for j := i + 1; j < len(scores); j++ {
+			if scores[j].pnl > scores[i].pnl {
+				scores[i], scores[j] = scores[j], scores[i]
+			}
+		}
+	}
+	
+	// 返回前N个
+	result := []string{}
+	for i := 0; i < n && i < len(scores); i++ {
+		result = append(result, scores[i].symbol)
+	}
+	return result
+}
+
+// getWorstSymbols 获取表现最差的N个币种（按总盈亏排序）
+func getWorstSymbols(symbolStats map[string]*logger.SymbolPerformance, n int) []string {
+	type symbolScore struct {
+		symbol string
+		pnl    float64
+	}
+	
+	var scores []symbolScore
+	for symbol, stats := range symbolStats {
+		// 需要至少2次交易才有统计意义
+		if stats.TotalTrades >= 2 {
+			scores = append(scores, symbolScore{symbol: symbol, pnl: stats.TotalPnL})
+		}
+	}
+	
+	// 按盈亏升序排序
+	for i := 0; i < len(scores); i++ {
+		for j := i + 1; j < len(scores); j++ {
+			if scores[j].pnl < scores[i].pnl {
+				scores[i], scores[j] = scores[j], scores[i]
+			}
+		}
+	}
+	
+	// 返回前N个
+	result := []string{}
+	for i := 0; i < n && i < len(scores); i++ {
+		result = append(result, scores[i].symbol)
+	}
+	return result
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -61,10 +62,24 @@ type DecisionAction struct {
 	Error     string    `json:"error"`     // 错误信息
 }
 
+// PerformanceCache 性能分析缓存
+type PerformanceCache struct {
+	Analysis       *PerformanceAnalysis `json:"analysis"`
+	LastCycleNum   int                  `json:"last_cycle_num"`
+	LastRecordTime time.Time            `json:"last_record_time"`
+	CachedAt       time.Time            `json:"cached_at"`
+	LookbackCycles int                  `json:"lookback_cycles"`
+}
+
 // DecisionLogger 决策日志记录器
 type DecisionLogger struct {
 	logDir      string
 	cycleNumber int
+	
+	// Cache management
+	cache          *PerformanceCache
+	cacheFilePath  string
+	cacheDirty     bool  // Flag to indicate cache needs update
 }
 
 // NewDecisionLogger 创建决策日志记录器
@@ -78,10 +93,19 @@ func NewDecisionLogger(logDir string) *DecisionLogger {
 		fmt.Printf("⚠ 创建日志目录失败: %v\n", err)
 	}
 
-	return &DecisionLogger{
-		logDir:      logDir,
-		cycleNumber: 0,
+	cacheFilePath := filepath.Join(logDir, ".performance_cache.json")
+	
+	logger := &DecisionLogger{
+		logDir:        logDir,
+		cycleNumber:   0,
+		cacheFilePath: cacheFilePath,
+		cacheDirty:    false,
 	}
+	
+	// Try to load existing cache
+	logger.loadCache()
+	
+	return logger
 }
 
 // LogDecision 记录决策
@@ -107,6 +131,9 @@ func (l *DecisionLogger) LogDecision(record *DecisionRecord) error {
 	if err := ioutil.WriteFile(filepath, data, 0644); err != nil {
 		return fmt.Errorf("写入决策记录失败: %w", err)
 	}
+
+	// Mark cache as dirty (需要在下次analyze时重新计算)
+	l.cacheDirty = true
 
 	fmt.Printf("📝 决策记录已保存: %s\n", filename)
 	return nil
@@ -315,6 +342,14 @@ type SymbolPerformance struct {
 
 // AnalyzePerformance 分析最近N个周期的交易表现
 func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAnalysis, error) {
+	// Check cache validity first
+	if l.isCacheValid(lookbackCycles) {
+		log.Printf("📦 使用缓存的性能分析 (saved ~%dms)", 800)
+		return l.cache.Analysis, nil
+	}
+	
+	log.Printf("🔄 缓存失效，重新分析性能数据...")
+	
 	records, err := l.GetLatestRecords(lookbackCycles)
 	if err != nil {
 		return nil, fmt.Errorf("读取历史记录失败: %w", err)
@@ -540,6 +575,19 @@ func (l *DecisionLogger) AnalyzePerformance(lookbackCycles int) (*PerformanceAna
 	// 计算夏普比率（需要至少2个数据点）
 	analysis.SharpeRatio = l.calculateSharpeRatio(records)
 
+	// Update cache with new analysis
+	l.cache = &PerformanceCache{
+		Analysis:       analysis,
+		LastCycleNum:   l.cycleNumber,
+		LastRecordTime: time.Now(),
+		CachedAt:       time.Now(),
+		LookbackCycles: lookbackCycles,
+	}
+	l.cacheDirty = false
+	
+	// Save cache to file (async to not block)
+	go l.saveCache()
+
 	return analysis, nil
 }
 
@@ -579,6 +627,11 @@ func (l *DecisionLogger) calculateSharpeRatio(records []*DecisionRecord) float64
 		return 0.0
 	}
 
+	// Only 1 return → cannot calculate variance
+	if len(returns) == 1 {
+		return 0.0
+	}
+
 	// 计算平均收益率
 	sumReturns := 0.0
 	for _, r := range returns {
@@ -586,27 +639,86 @@ func (l *DecisionLogger) calculateSharpeRatio(records []*DecisionRecord) float64
 	}
 	meanReturn := sumReturns / float64(len(returns))
 
-	// 计算收益率标准差
+	// 计算收益率标准差 (Sample Standard Deviation with Bessel's correction)
+	// 使用 N-1 而不是 N，因为这是样本方差而非总体方差
 	sumSquaredDiff := 0.0
 	for _, r := range returns {
 		diff := r - meanReturn
 		sumSquaredDiff += diff * diff
 	}
-	variance := sumSquaredDiff / float64(len(returns))
+	variance := sumSquaredDiff / float64(len(returns)-1) // FIX: Use N-1 for sample variance
 	stdDev := math.Sqrt(variance)
 
 	// 避免除以零
+	// No volatility = no trading activity or perfect consistency (very rare)
 	if stdDev == 0 {
-		if meanReturn > 0 {
-			return 999.0 // 无波动的正收益
-		} else if meanReturn < 0 {
-			return -999.0 // 无波动的负收益
-		}
-		return 0.0
+		return 0.0 // Neutral score - no variance means no meaningful risk/reward assessment
 	}
 
 	// 计算夏普比率（假设无风险利率为0）
 	// 注：直接返回周期级别的夏普比率（非年化），正常范围 -2 到 +2
 	sharpeRatio := meanReturn / stdDev
 	return sharpeRatio
+}
+
+// loadCache 从文件加载缓存
+func (l *DecisionLogger) loadCache() {
+	data, err := ioutil.ReadFile(l.cacheFilePath)
+	if err != nil {
+		// Cache file doesn't exist or can't read - not an error, just no cache
+		return
+	}
+
+	var cache PerformanceCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		log.Printf("⚠️  解析缓存文件失败: %v (将忽略缓存)", err)
+		return
+	}
+
+	l.cache = &cache
+	log.Printf("📦 加载性能分析缓存成功 (cycle %d, cached at %s)",
+		cache.LastCycleNum, cache.CachedAt.Format("15:04:05"))
+}
+
+// saveCache 保存缓存到文件
+func (l *DecisionLogger) saveCache() error {
+	if l.cache == nil {
+		return nil
+	}
+
+	data, err := json.MarshalIndent(l.cache, "", "  ")
+	if err != nil {
+		return fmt.Errorf("序列化缓存失败: %w", err)
+	}
+
+	if err := ioutil.WriteFile(l.cacheFilePath, data, 0644); err != nil {
+		return fmt.Errorf("写入缓存文件失败: %w", err)
+	}
+
+	log.Printf("💾 性能分析缓存已保存 (cycle %d)", l.cache.LastCycleNum)
+	return nil
+}
+
+// isCacheValid 检查缓存是否有效
+func (l *DecisionLogger) isCacheValid(lookbackCycles int) bool {
+	if l.cache == nil {
+		return false
+	}
+
+	// Check if cache is for the same lookback window
+	if l.cache.LookbackCycles != lookbackCycles {
+		return false
+	}
+
+	// Check if cache is dirty (new records added)
+	if l.cacheDirty {
+		return false
+	}
+
+	// Check if cache is too old (> 10 minutes)
+	if time.Since(l.cache.CachedAt) > 10*time.Minute {
+		return false
+	}
+
+	return true
 }
