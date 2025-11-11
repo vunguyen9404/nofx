@@ -316,24 +316,53 @@ func buildUserPrompt(ctx *Context) string {
 	if len(ctx.Positions) > 0 {
 		sb.WriteString("## 当前持仓\n")
 		for i, pos := range ctx.Positions {
-			// 计算持仓时长
-			holdingDuration := ""
+			// 计算持仓时长和开仓时间
+			openTimeInfo := ""
 			if pos.UpdateTime > 0 {
-				durationMs := time.Now().UnixMilli() - pos.UpdateTime
-				durationMin := durationMs / (1000 * 60) // 转换为分钟
-				if durationMin < 60 {
-					holdingDuration = fmt.Sprintf(" | 持仓时长%d分钟", durationMin)
+				openTime := time.UnixMilli(pos.UpdateTime)
+				now := time.Now()
+				duration := now.Sub(openTime)
+				
+				// Format timestamp: YYYY-MM-DD HH:MM
+				timeStr := openTime.Format("2006-01-02 15:04")
+				
+				// Format duration (same style as Recent Trades)
+				durationStr := ""
+				if duration < time.Hour {
+					// < 1 hour: "3m ago"
+					mins := int(duration.Minutes())
+					if mins == 0 {
+						durationStr = "just now"
+					} else {
+						durationStr = fmt.Sprintf("%dm ago", mins)
+					}
+				} else if duration < 24*time.Hour {
+					// 1-24 hours: "5h12m ago" or "5h ago"
+					hours := int(duration.Hours())
+					mins := int(duration.Minutes()) % 60
+					if mins > 0 {
+						durationStr = fmt.Sprintf("%dh%dm ago", hours, mins)
+					} else {
+						durationStr = fmt.Sprintf("%dh ago", hours)
+					}
 				} else {
-					durationHour := durationMin / 60
-					durationMinRemainder := durationMin % 60
-					holdingDuration = fmt.Sprintf(" | 持仓时长%d小时%d分钟", durationHour, durationMinRemainder)
+					// >= 24 hours: "1d9h ago" or "2d ago"
+					days := int(duration.Hours() / 24)
+					hours := int(duration.Hours()) % 24
+					if hours > 0 {
+						durationStr = fmt.Sprintf("%dd%dh ago", days, hours)
+					} else {
+						durationStr = fmt.Sprintf("%dd ago", days)
+					}
 				}
+				
+				openTimeInfo = fmt.Sprintf(" | 开仓: %s (%s)", timeStr, durationStr)
 			}
 
-		sb.WriteString(fmt.Sprintf("%d. %s %s | 入场价%.4f 当前价%.4f | 盈亏%+.2f%% (%+.2f USDT) | 杠杆%dx | 保证金%.0f | 强平价%.4f%s\n\n",
-			i+1, pos.Symbol, strings.ToUpper(pos.Side),
+		sb.WriteString(fmt.Sprintf("%d. %s %s%s | 入场价%.4f 当前价%.4f | 盈亏%+.2f%% (%+.2f USDT) | 杠杆%dx | 保证金%.0f | 强平价%.4f\n\n",
+			i+1, pos.Symbol, strings.ToUpper(pos.Side), openTimeInfo,
 			pos.EntryPrice, pos.MarkPrice, pos.UnrealizedPnLPct, pos.UnrealizedPnL,
-			pos.Leverage, pos.MarginUsed, pos.LiquidationPrice, holdingDuration))
+			pos.Leverage, pos.MarginUsed, pos.LiquidationPrice))
 
 			// 使用FormatMarketData输出完整市场数据
 			if marketData, ok := ctx.MarketDataMap[pos.Symbol]; ok {
